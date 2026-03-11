@@ -1,4 +1,5 @@
-bin/
+bin/Release/
+bin/Debug/
 obj/
 out/
 *.user
