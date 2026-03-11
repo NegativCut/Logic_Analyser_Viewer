@@ -49,8 +49,41 @@ public class Form1 : Form
     private static readonly string[] CH_NAME =
         { "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7" };
 
+    // ── Dark menu color table ─────────────────────────────────────────
+    private sealed class DarkColorTable : ProfessionalColorTable
+    {
+        static readonly Color _bg      = Color.FromArgb(40, 40, 40);
+        static readonly Color _border  = Color.FromArgb(70, 70, 70);
+        static readonly Color _hover   = Color.FromArgb(70, 70, 90);
+        public override Color MenuItemSelected          => _hover;
+        public override Color MenuItemBorder            => _border;
+        public override Color MenuBorder                => _border;
+        public override Color ToolStripDropDownBackground => _bg;
+        public override Color ImageMarginGradientBegin  => _bg;
+        public override Color ImageMarginGradientMiddle => _bg;
+        public override Color ImageMarginGradientEnd    => _bg;
+        public override Color MenuItemSelectedGradientBegin => _hover;
+        public override Color MenuItemSelectedGradientEnd   => _hover;
+        public override Color MenuItemPressedGradientBegin  => _hover;
+        public override Color MenuItemPressedGradientEnd    => _hover;
+        public override Color MenuStripGradientBegin    => Color.FromArgb(30, 30, 30);
+        public override Color MenuStripGradientEnd      => Color.FromArgb(30, 30, 30);
+    }
+
+    // ── Double-buffered panel ─────────────────────────────────────────
+    private sealed class DoubleBufferedPanel : Panel
+    {
+        public DoubleBufferedPanel()
+        {
+            SetStyle(ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.AllPaintingInWmPaint  |
+                     ControlStyles.UserPaint, true);
+            UpdateStyles();
+        }
+    }
+
     // ── Controls ──────────────────────────────────────────────────────
-    private readonly Panel      _wavePanel;
+    private readonly DoubleBufferedPanel _wavePanel;
     private readonly HScrollBar _hScroll;
     private readonly Label      _cursorLabel;
     private readonly NumericUpDown          _glitchFilter;
@@ -62,11 +95,34 @@ public class Form1 : Form
     private readonly ToolStripStatusLabel   _slActive;
     private readonly ToolStripStatusLabel   _slView;
     private readonly ToolStripStatusLabel   _slSize;
+    private readonly ToolStripStatusLabel   _slCursor;
+
+    // ── Cached GDI resources (created once, reused every frame) ──────
+    private Font         _labelFont  = null!;
+    private Font         _axisFont   = null!;
+    private Font         _cursorFont = null!;
+    private Pen          _sepPen     = null!;
+    private Pen          _borderPen  = null!;
+    private Pen          _gridPen    = null!;
+    private Pen          _tickPen    = null!;
+    private SolidBrush   _textBrush  = null!;
+    private SolidBrush   _bgBrush0   = null!;
+    private SolidBrush   _bgBrush1   = null!;
+    private Pen[]        _chPens     = null!;
+    private SolidBrush[] _chBrushes  = null!;
+    private Pen          _cursorPenA = null!;
+    private Pen          _cursorPenB = null!;
+    private SolidBrush   _cursorBrA  = null!;
+    private SolidBrush   _cursorBrB  = null!;
 
     private bool   _dragging;
     private int    _dragStartX;
     private double _dragStartViewStart;
     private double _dragStartViewEnd;
+
+    private double _cursorA        = double.NaN;
+    private double _cursorB        = double.NaN;
+    private int    _draggingCursor = 0;   // 0 = none, 1 = A, 2 = B
 
     // ── Constructor ───────────────────────────────────────────────────
     public Form1()
@@ -77,19 +133,22 @@ public class Form1 : Form
         BackColor     = Color.FromArgb(20, 20, 20);
         ForeColor     = Color.White;
         StartPosition = FormStartPosition.CenterScreen;
-        WindowState   = FormWindowState.Normal;
+        WindowState   = FormWindowState.Maximized;
 
         // ── Menu bar ──
         var menu     = new MenuStrip { BackColor = Color.FromArgb(30, 30, 30), ForeColor = Color.White };
-        var fileMenu = new ToolStripMenuItem("File") { ForeColor = Color.White };
+        var fileMenu = new ToolStripMenuItem("File") { ForeColor = Color.White, BackColor = Color.FromArgb(30, 30, 30) };
         var openItem = new ToolStripMenuItem("Open…")
         {
             ForeColor    = Color.White,
+            BackColor    = Color.FromArgb(40, 40, 40),
             ShortcutKeys = Keys.Control | Keys.O
         };
         openItem.Click += (_, _) => OpenFile();
         fileMenu.DropDownItems.Add(openItem);
+        fileMenu.DropDown.BackColor = Color.FromArgb(40, 40, 40);
         menu.Items.Add(fileMenu);
+        menu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
 
         _cursorLabel = new Label
         {
@@ -138,6 +197,7 @@ public class Form1 : Form
         _slActive = MakeLabel("", 180);
         _slView   = MakeLabel("", 130);
         _slSize   = MakeLabel("", 100);
+        _slCursor = MakeLabel("", 200);
 
         _statusStrip = new StatusStrip
         {
@@ -155,6 +215,7 @@ public class Form1 : Form
         _slActive.ToolTipText = "Channels with at least one transition";
         _slView.ToolTipText   = "Current view span";
         _slSize.ToolTipText   = "File size on disk";
+        _slCursor.ToolTipText = "Time between cursors A and B";
 
         // Glitch filter — right-aligned in status bar
         _glitchFilter = new NumericUpDown
@@ -195,18 +256,18 @@ public class Form1 : Form
 
         _statusStrip.Items.AddRange(new ToolStripItem[]
         {
-            _slFile, _slEvents, _slSpan, _slRate, _slActive, _slView, _slSize,
+            _slFile, _slEvents, _slSpan, _slRate, _slActive, _slView, _slSize, _slCursor,
             glitchLblHost, glitchCtrlHost, glitchUnitHost
         });
         Controls.Add(_statusStrip);
 
         // ── Waveform panel ──
-        _wavePanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
+        _wavePanel = new DoubleBufferedPanel { Dock = DockStyle.Fill, BackColor = Color.Black };
         _wavePanel.Paint      += OnPaint;
         _wavePanel.MouseWheel += OnMouseWheel;
         _wavePanel.MouseDown  += OnMouseDown;
         _wavePanel.MouseMove  += OnMouseMove;
-        _wavePanel.MouseUp    += (_, _) => _dragging = false;
+        _wavePanel.MouseUp    += (_, _) => { _dragging = false; _draggingCursor = 0; };
         _wavePanel.MouseEnter += (_, _) => _wavePanel.Focus();
         _wavePanel.Resize     += (_, _) => _wavePanel.Invalidate();
 
@@ -222,6 +283,49 @@ public class Form1 : Form
             if (files?.Length > 0) LoadFile(files[0]);
         };
         Controls.Add(_wavePanel);
+
+        InitGdi();
+    }
+
+    // ── GDI resource management ───────────────────────────────────────
+    private void InitGdi()
+    {
+        _labelFont  = new Font("Consolas", 9, FontStyle.Bold);
+        _axisFont   = new Font("Consolas", 9);
+        _cursorFont = new Font("Consolas", 8, FontStyle.Bold);
+        _sepPen     = new Pen(Color.FromArgb(40, 40, 40));
+        _borderPen  = new Pen(Color.FromArgb(50, 50, 50));
+        _gridPen    = new Pen(Color.FromArgb(30, 30, 30));
+        _tickPen    = new Pen(Color.FromArgb(80, 80, 80));
+        _textBrush  = new SolidBrush(Color.FromArgb(150, 150, 150));
+        _bgBrush0   = new SolidBrush(Color.FromArgb(10, 10, 10));
+        _bgBrush1   = new SolidBrush(Color.FromArgb(16, 16, 16));
+        _chPens    = new Pen[CHANNELS];
+        _chBrushes = new SolidBrush[CHANNELS];
+        for (int i = 0; i < CHANNELS; i++)
+        {
+            _chPens[i]    = new Pen(CH_COLOR[i], 1.5f);
+            _chBrushes[i] = new SolidBrush(CH_COLOR[i]);
+        }
+        _cursorPenA = new Pen(Color.White,  1f) { DashStyle = DashStyle.Dash };
+        _cursorPenB = new Pen(Color.Orange, 1f) { DashStyle = DashStyle.Dash };
+        _cursorBrA  = new SolidBrush(Color.White);
+        _cursorBrB  = new SolidBrush(Color.Orange);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _labelFont?.Dispose(); _axisFont?.Dispose(); _cursorFont?.Dispose();
+            _sepPen?.Dispose(); _borderPen?.Dispose(); _gridPen?.Dispose(); _tickPen?.Dispose();
+            _textBrush?.Dispose(); _bgBrush0?.Dispose(); _bgBrush1?.Dispose();
+            if (_chPens    != null) foreach (var p in _chPens)    p?.Dispose();
+            if (_chBrushes != null) foreach (var b in _chBrushes) b?.Dispose();
+            _cursorPenA?.Dispose(); _cursorPenB?.Dispose();
+            _cursorBrA?.Dispose();  _cursorBrB?.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     // ── File loading ──────────────────────────────────────────────────
@@ -467,6 +571,8 @@ public class Form1 : Form
         {
             _viewStart = 0;
             _viewEnd   = _totalUs;
+            _cursorA   = _totalUs * 0.25;
+            _cursorB   = _totalUs * 0.75;
         }
         else
         {
@@ -540,6 +646,7 @@ public class Form1 : Form
         else _slSize.Text = "";
 
         UpdateViewStatus();
+        UpdateCursorStatus();
     }
 
     private void UpdateViewStatus()
@@ -547,6 +654,15 @@ public class Form1 : Form
         if (_totalUs <= 0) { _slView.Text = ""; return; }
         double span = _viewEnd - _viewStart;
         _slView.Text = $"  View: {FormatTime(span)}";
+    }
+
+    private void UpdateCursorStatus()
+    {
+        if (double.IsNaN(_cursorA) || double.IsNaN(_cursorB)) { _slCursor.Text = ""; return; }
+        double dt     = Math.Abs(_cursorB - _cursorA);
+        string dtStr  = FormatTime(dt);
+        string freqStr = dt > 0 ? $"  ({1_000_000.0 / dt:0.#} Hz)" : "";
+        _slCursor.Text = $"  ΔA→B: {dtStr}{freqStr}";
     }
 
     // ── Paint ─────────────────────────────────────────────────────────
@@ -579,33 +695,27 @@ public class Form1 : Form
             int y = WAVE_TOP + ch * laneH;
             if (y >= waveH) break;
             int h = Math.Min(laneH, waveH - y);
-            using var bg = new SolidBrush(ch % 2 == 0
-                ? Color.FromArgb(10, 10, 10)
-                : Color.FromArgb(16, 16, 16));
-            g.FillRectangle(bg, LABEL_W, y, pw - LABEL_W, h);
+            g.FillRectangle(ch % 2 == 0 ? _bgBrush0 : _bgBrush1, LABEL_W, y, pw - LABEL_W, h);
         }
 
         DrawTimeAxis(g, pw, waveH);
 
-        using var labelFont = new Font("Consolas", 9, FontStyle.Bold);
         for (int ch = 0; ch < CHANNELS; ch++)
         {
             int laneTop = WAVE_TOP + ch * laneH;
             if (laneTop >= waveH) break;
             int lh = Math.Min(laneH, waveH - laneTop);
 
-            using var sep = new Pen(Color.FromArgb(40, 40, 40));
-            g.DrawLine(sep, 0, laneTop, pw, laneTop);
-
-            using var lb = new SolidBrush(CH_COLOR[ch]);
-            g.DrawString(CH_NAME[ch], labelFont, lb,
-                         2, laneTop + (lh - labelFont.Height) / 2);
+            g.DrawLine(_sepPen, 0, laneTop, pw, laneTop);
+            g.DrawString(CH_NAME[ch], _labelFont, _chBrushes[ch],
+                         2, laneTop + (lh - _labelFont.Height) / 2);
 
             DrawChannel(g, ch, laneTop, lh, pw);
         }
 
-        using var border = new Pen(Color.FromArgb(50, 50, 50));
-        g.DrawLine(border, 0, waveH, pw, waveH);
+        g.DrawLine(_borderPen, 0, waveH, pw, waveH);
+
+        DrawCursors(g, pw, waveH);
     }
 
     private void DrawChannel(Graphics g, int ch, int laneTop, int laneH, int panelW)
@@ -626,7 +736,9 @@ public class Form1 : Form
             first = i;
         }
 
-        var pts = new List<Point>(_times.Length);
+        // Cap initial capacity at panel width — you can never usefully have more
+        // X-unique points than pixels wide, regardless of how many events exist.
+        var pts = new List<Point>(Math.Min(_times.Length - first + 2, waveW + 4));
 
         for (int i = first; i < _times.Length; i++)
         {
@@ -654,8 +766,7 @@ public class Form1 : Form
 
         if (pts.Count < 2) return;
 
-        using var pen = new Pen(CH_COLOR[ch], 1.5f);
-        g.DrawLines(pen, pts.ToArray());
+        g.DrawLines(_chPens[ch], pts.ToArray());
     }
 
     private void DrawTimeAxis(Graphics g, int panelW, int waveH)
@@ -671,23 +782,35 @@ public class Form1 : Form
 
         double firstTick = Math.Ceiling(_viewStart / interval) * interval;
 
-        using var gridPen   = new Pen(Color.FromArgb(30, 30, 30));
-        using var tickPen   = new Pen(Color.FromArgb(80, 80, 80));
-        using var textBrush = new SolidBrush(Color.FromArgb(150, 150, 150));
-        using var axisFont  = new Font("Consolas", 9);
-
         for (double t = firstTick; t <= _viewEnd + interval * 0.01; t += interval)
         {
             int x = TimeToX(t, waveW);
             if (x < LABEL_W || x > panelW) continue;
 
-            g.DrawLine(gridPen, x, 0, x, waveH);
-            g.DrawLine(tickPen, x, waveH, x, waveH + 5);
+            g.DrawLine(_gridPen, x, 0, x, waveH);
+            g.DrawLine(_tickPen, x, waveH, x, waveH + 5);
 
             string lbl = FormatTime(t);
-            var    sz  = g.MeasureString(lbl, axisFont);
-            g.DrawString(lbl, axisFont, textBrush, x - sz.Width / 2f, waveH + 7f);
+            var    sz  = g.MeasureString(lbl, _axisFont);
+            g.DrawString(lbl, _axisFont, _textBrush, x - sz.Width / 2f, waveH + 7f);
         }
+    }
+
+    private void DrawCursors(Graphics g, int panelW, int waveH)
+    {
+        if (double.IsNaN(_cursorA) && double.IsNaN(_cursorB)) return;
+        int waveW = panelW - LABEL_W;
+
+        void DrawOne(double t, Pen pen, SolidBrush br, string lbl)
+        {
+            int x = TimeToX(t, waveW);
+            if (x < LABEL_W - 1 || x > panelW + 1) return;
+            g.DrawLine(pen, x, 0, x, waveH);
+            g.DrawString(lbl, _cursorFont, br, x + 2, 2);
+        }
+
+        if (!double.IsNaN(_cursorA)) DrawOne(_cursorA, _cursorPenA, _cursorBrA, "A");
+        if (!double.IsNaN(_cursorB)) DrawOne(_cursorB, _cursorPenB, _cursorBrB, "B");
     }
 
     // ── Coordinate helpers ────────────────────────────────────────────
@@ -735,6 +858,22 @@ public class Form1 : Form
     private void OnMouseDown(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
+
+        int waveW = _wavePanel.Width - LABEL_W;
+        const int HIT = 6;
+        if (!double.IsNaN(_cursorA) && Math.Abs(TimeToX(_cursorA, waveW) - e.X) <= HIT)
+        {
+            _draggingCursor   = 1;
+            _wavePanel.Cursor = Cursors.VSplit;
+            return;
+        }
+        if (!double.IsNaN(_cursorB) && Math.Abs(TimeToX(_cursorB, waveW) - e.X) <= HIT)
+        {
+            _draggingCursor   = 2;
+            _wavePanel.Cursor = Cursors.VSplit;
+            return;
+        }
+
         _dragging           = true;
         _dragStartX         = e.X;
         _dragStartViewStart = _viewStart;
@@ -747,7 +886,29 @@ public class Form1 : Form
         if (_totalUs > 0)
             _cursorLabel.Text = $"t = {FormatTime(XToTime(e.X))}";
 
-        if (!_dragging) return;
+        // Cursor drag takes priority
+        if (_draggingCursor != 0)
+        {
+            double t = Math.Clamp(XToTime(e.X), 0, _totalUs);
+            if (_draggingCursor == 1) _cursorA = t;
+            else                      _cursorB = t;
+            UpdateCursorStatus();
+            _wavePanel.Invalidate();
+            return;
+        }
+
+        if (!_dragging)
+        {
+            // Hover: show VSplit cursor when near a cursor line
+            if (_totalUs > 0)
+            {
+                int ww = _wavePanel.Width - LABEL_W;
+                bool near = (!double.IsNaN(_cursorA) && Math.Abs(TimeToX(_cursorA, ww) - e.X) <= 6)
+                          || (!double.IsNaN(_cursorB) && Math.Abs(TimeToX(_cursorB, ww) - e.X) <= 6);
+                _wavePanel.Cursor = near ? Cursors.VSplit : Cursors.Default;
+            }
+            return;
+        }
 
         int    waveW = _wavePanel.Width - LABEL_W;
         double span  = _dragStartViewEnd - _dragStartViewStart;
@@ -766,6 +927,7 @@ public class Form1 : Form
     {
         base.OnMouseUp(e);
         _dragging         = false;
+        _draggingCursor   = 0;
         _wavePanel.Cursor = Cursors.Default;
     }
 
