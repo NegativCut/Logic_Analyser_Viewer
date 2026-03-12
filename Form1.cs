@@ -270,6 +270,16 @@ public class Form1 : Form
         _wavePanel.MouseUp    += (_, _) => { _dragging = false; _draggingCursor = 0; };
         _wavePanel.MouseEnter += (_, _) => _wavePanel.Focus();
         _wavePanel.Resize     += (_, _) => _wavePanel.Invalidate();
+        _wavePanel.KeyDown    += (_, e) =>
+        {
+            if (e.KeyCode == Keys.R && _totalUs > 0)
+            {
+                _cursorA = _viewStart + (_viewEnd - _viewStart) * 0.25;
+                _cursorB = _viewStart + (_viewEnd - _viewStart) * 0.75;
+                UpdateCursorStatus();
+                _wavePanel.Invalidate();
+            }
+        };
 
         _wavePanel.AllowDrop = true;
         _wavePanel.DragEnter += (_, e) =>
